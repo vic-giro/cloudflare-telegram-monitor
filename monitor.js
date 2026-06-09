@@ -2,13 +2,12 @@ const CF_ZONE_ID = process.env.CF_ZONE_ID;
 const CF_API_TOKEN = process.env.CF_API_TOKEN;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-
-const UMBRAL_ERRORES = 50; // Alerta si hay más de 50 errores
+const IS_FIRST_RUN = process.env.IS_FIRST_RUN === 'true'; // Bandera que le pasará GitHub
 
 async function checkCloudflare() {
-  // Calcular tiempo de los últimos 5 minutos en formato ISO UTC
   const cincoMinutosAtras = new Date(Date.now() - 5 * 60 * 1000).toISOString();
 
+  // Traer todos los estatus (sin filtrar por error en la query)
   const query = {
     query: `query {
       viewer {
@@ -17,7 +16,6 @@ async function checkCloudflare() {
             limit: 100
             filter: {
               datetime_geq: "${cincoMinutosAtras}"
-              edgeResponseStatus_in: [500, 522]
             }
           ) {
             count
@@ -43,35 +41,45 @@ async function checkCloudflare() {
     const resData = await response.json();
     const groups = resData.data?.viewer?.zones[0]?.httpRequestsAdaptiveGroups || [];
 
-    let totalErrores = 0;
-    let desglose = '';
+    let totalErroresCriticos = 0;
+    let resumenGeneral = '';
+    let desgloseErrores = '';
 
     groups.forEach(group => {
       const status = group.dimensions.edgeResponseStatus;
       const count = group.count;
-      totalErrores += count;
-      desglose += `• *Error ${status}:* ${count} peticiones\n`;
+
+      // Alimenta el resumen general para la primera corrida
+      resumenGeneral += `• *Status ${status}:* ${count} peticiones\n`;
+
+      // Cuenta sólo errores de servidor (500 para arriba)
+      if (status >= 500) {
+        totalErroresCriticos += count;
+        desgloseErrores += `• *Status ${status}:* ${count} peticiones\n`;
+      }
     });
 
-    if (totalErrores > UMBRAL_ERRORES) {
-      await sendTelegramAlert(totalErrores, desglose);
+    if (IS_FIRST_RUN) {
+      // 🚀 PRIMERA CORRIDA: Reporte completo de salud del sitio
+      const msg = `🚀 *MONITOR INICIALIZADO*\n\nEste es el estado actual de tus peticiones en los últimos 5 min:\n\n${resumenGeneral || '• Sin tráfico registrado.'}\n_A partir de ahora, solo avisaré si hay errores ≥ 500._`;
+      await sendTelegramAlert(msg);
+      console.log("Primer reporte enviado a Telegram.");
+    } else if (totalErroresCriticos > 0) {
+      // 🚨 CORRIDAS SUBSECUENTES: Solo alerta si hay broncas reales en el backend
+      const msg = `⚠️ *ALERTA DE INFRAESTRUCTURA*\n\nSe detectaron *${totalErroresCriticos}* errores de servidor (≥ 500) en el sitemap.\n\n*Detalle del fallo:*\n${desgloseErrores}\n📍 _Host: capitalmexico.com.mx_`;
+      await sendTelegramAlert(msg);
+      console.log(`Alerta de error enviada. Conteo de fallos: ${totalErroresCriticos}`);
     } else {
-      console.log(`Todo en orden. Errores detectados: ${totalErrores}`);
+      console.log(`Monitoreo rutinario limpio. Errores críticos: ${totalErroresCriticos}`);
     }
 
   } catch (error) {
-    console.error('Error al consultar la API de Cloudflare:', error);
+    console.error('Fallo en la ejecución del monitor:', error);
   }
 }
 
-async function sendTelegramAlert(total, detalle) {
-  const mensaje = `⚠️ *ALERTA DESDE GITHUB ACTIONS*\n\n` +
-                  `Se detectaron *${total}* errores críticos en los últimos 5 minutos.\n\n` +
-                  `*Desglose:*\n${detalle}\n` +
-                  `📍 _Host: capitalmexico.com.mx_`;
-
+async function sendTelegramAlert(mensaje) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-
   await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
